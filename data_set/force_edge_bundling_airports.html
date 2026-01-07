@@ -1,0 +1,378 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Force-Directed Edge Bundling (AirPorts)</title>
+  <style>
+    html,body{height:100%;margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    #wrap{display:grid;grid-template-rows:auto 1fr; height:100%}
+    #bar{display:flex;gap:14px;align-items:center;padding:10px 12px;border-bottom:1px solid #ddd;flex-wrap:wrap}
+    #bar label{font-size:12px;color:#222;display:flex;gap:8px;align-items:center}
+    #bar input[type="range"]{width:180px}
+    #bar button{padding:6px 10px;border:1px solid #bbb;border-radius:8px;background:#fff;cursor:pointer}
+    #bar button:active{transform:translateY(1px)}
+    #status{font-size:12px;color:#444;margin-left:auto}
+    svg{width:100%;height:100%;display:block}
+    .edge{fill:none;stroke:#111;stroke-opacity:.18;stroke-width:1}
+    .node{fill:#111;fill-opacity:.55}
+  </style>
+</head>
+<body>
+<div id="wrap">
+  <div id="bar">
+    <button id="run">Run bundling</button>
+    <label>Compatibility threshold
+      <input id="ct" type="range" min="0" max="1" step="0.01" value="0.6">
+      <span id="ctv">0.60</span>
+    </label>
+    <label>Cycles
+      <input id="cycles" type="range" min="1" max="10" step="1" value="6">
+      <span id="cyclesv">6</span>
+    </label>
+    <label>Iters / cycle
+      <input id="iters" type="range" min="10" max="100" step="5" value="50">
+      <span id="itersv">50</span>
+    </label>
+    <label>Subdivision
+      <input id="sub" type="range" min="0" max="7" step="1" value="4">
+      <span id="subv">4</span>
+    </label>
+    <label>Step size
+      <input id="step" type="range" min="0.01" max="0.5" step="0.01" value="0.1">
+      <span id="stepv">0.10</span>
+    </label>
+    <span id="status">Idle</span>
+  </div>
+  <svg id="viz"></svg>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+<script>
+/**
+ * Minimal (but working) Force-Directed Edge Bundling (FDEB) implementation.
+ * Based on Holten & van Wijk (2009) concept; implemented as a self-contained class.
+ */
+class ForceEdgeBundling {
+  constructor() {
+    this._nodes = [];
+    this._edges = [];
+    this._compatibilityThreshold = 0.6;
+    this._cycles = 6;
+    this._iterations = 50;
+    this._subdivision = 4;     // number of subdivision refinement steps (0..)
+    this._stepSize = 0.1;
+    this._K = 0.1;             // spring constant along edge (internal)
+    this._S = 1.0;             // global strength multiplier (internal)
+  }
+
+  nodes(v){ if(!arguments.length) return this._nodes; this._nodes=v; return this; }
+  edges(v){ if(!arguments.length) return this._edges; this._edges=v; return this; }
+  compatibilityThreshold(v){ if(!arguments.length) return this._compatibilityThreshold; this._compatibilityThreshold=v; return this; }
+  cycles(v){ if(!arguments.length) return this._cycles; this._cycles=v; return this; }
+  iterations(v){ if(!arguments.length) return this._iterations; this._iterations=v; return this; }
+  subdivision(v){ if(!arguments.length) return this._subdivision; this._subdivision=v; return this; }
+  stepSize(v){ if(!arguments.length) return this._stepSize; this._stepSize=v; return this; }
+
+  // ---- vector helpers ----
+  static add(a,b){ return [a[0]+b[0], a[1]+b[1]]; }
+  static sub(a,b){ return [a[0]-b[0], a[1]-b[1]]; }
+  static mul(a,s){ return [a[0]*s, a[1]*s]; }
+  static len(a){ return Math.hypot(a[0], a[1]); }
+  static dot(a,b){ return a[0]*b[0]+a[1]*b[1]; }
+  static norm(a){ const l=ForceEdgeBundling.len(a); return l===0?[0,0]:[a[0]/l,a[1]/l]; }
+
+  _edgeVec(e){
+    const s = this._nodes[e.source], t = this._nodes[e.target];
+    return [t.x - s.x, t.y - s.y];
+  }
+  _edgeLen(e){ return Math.hypot(this._nodes[e.target].x - this._nodes[e.source].x,
+                                 this._nodes[e.target].y - this._nodes[e.source].y); }
+  _edgeMid(e){
+    const s=this._nodes[e.source], t=this._nodes[e.target];
+    return [(s.x+t.x)/2, (s.y+t.y)/2];
+  }
+  _projectPointToLine(p, a, b){
+    // projection of p onto infinite line through a-b
+    const ap = ForceEdgeBundling.sub(p,a);
+    const ab = ForceEdgeBundling.sub(b,a);
+    const ab2 = ForceEdgeBundling.dot(ab,ab);
+    if(ab2===0) return a;
+    const t = ForceEdgeBundling.dot(ap,ab)/ab2;
+    return ForceEdgeBundling.add(a, ForceEdgeBundling.mul(ab,t));
+  }
+
+  // ---- compatibility measures (Holten) ----
+  _angleCompatibility(ei, ej){
+    const vi = ForceEdgeBundling.norm(this._edgeVec(ei));
+    const vj = ForceEdgeBundling.norm(this._edgeVec(ej));
+    return Math.abs(ForceEdgeBundling.dot(vi,vj)); // [0,1]
+  }
+  _scaleCompatibility(ei, ej){
+    const li = this._edgeLen(ei), lj = this._edgeLen(ej);
+    return 2 / ( (Math.max(li,lj)/Math.min(li,lj)) + (Math.min(li,lj)/Math.max(li,lj)) ); // in (0,1]
+  }
+  _positionCompatibility(ei, ej){
+    const li = this._edgeLen(ei), lj = this._edgeLen(ej);
+    const mi = this._edgeMid(ei), mj = this._edgeMid(ej);
+    const d = ForceEdgeBundling.len(ForceEdgeBundling.sub(mi,mj));
+    return (li+lj)/(li+lj+2*d); // in (0,1]
+  }
+  _visibilityCompatibility(ei, ej){
+    // visibility from ei to ej and vice versa, averaged
+    const si=this._nodes[ei.source], ti=this._nodes[ei.target];
+    const sj=this._nodes[ej.source], tj=this._nodes[ej.target];
+
+    // helper: visibility of e1 w.r.t e2
+    const vis = (s1,t1,s2,t2) => {
+      const p0 = this._projectPointToLine(s2,[s1.x,s1.y],[t1.x,t1.y]);
+      const p1 = this._projectPointToLine(t2,[s1.x,s1.y],[t1.x,t1.y]);
+      const m = [(p0[0]+p1[0])/2, (p0[1]+p1[1])/2];
+      const mi = [(s1.x+t1.x)/2, (s1.y+t1.y)/2];
+      const denom = ForceEdgeBundling.len(ForceEdgeBundling.sub(p0,p1));
+      if(denom===0) return 0;
+      const num = 2*ForceEdgeBundling.len(ForceEdgeBundling.sub(mi,m));
+      return Math.max(0, 1 - (num/denom));
+    };
+
+    const v1 = vis(si,ti,sj,tj);
+    const v2 = vis(sj,tj,si,ti);
+    return (v1+v2)/2;
+  }
+  _compatibility(ei, ej){
+    return this._angleCompatibility(ei,ej)
+         * this._scaleCompatibility(ei,ej)
+         * this._positionCompatibility(ei,ej)
+         * this._visibilityCompatibility(ei,ej);
+  }
+
+  _buildCompatibilityLists(){
+    const n = this._edges.length;
+    const compat = Array.from({length:n}, () => []);
+    for(let i=0;i<n;i++){
+      for(let j=i+1;j<n;j++){
+        const c = this._compatibility(this._edges[i], this._edges[j]);
+        if(c >= this._compatibilityThreshold){
+          compat[i].push(j);
+          compat[j].push(i);
+        }
+      }
+    }
+    return compat;
+  }
+
+  _initialEdgePoints(){
+    // for each edge, points = [source, ...subdiv..., target]
+    const pts = [];
+    for(const e of this._edges){
+      const s=this._nodes[e.source], t=this._nodes[e.target];
+      pts.push([[s.x,s.y],[t.x,t.y]]);
+    }
+    return pts;
+  }
+
+  _subdivide(points){
+    // Insert midpoints between every consecutive pair
+    const out = [];
+    for(const poly of points){
+      const np = [];
+      for(let i=0;i<poly.length-1;i++){
+        const a=poly[i], b=poly[i+1];
+        np.push(a);
+        np.push([(a[0]+b[0])/2, (a[1]+b[1])/2]);
+      }
+      np.push(poly[poly.length-1]);
+      out.push(np);
+    }
+    return out;
+  }
+
+  _applyForces(points, compatLists){
+    // one iteration of forces on internal points (not endpoints)
+    const newPts = points.map(poly => poly.map(p => [p[0],p[1]]));
+
+    // precompute edge segment length for spring force
+    for(let ei=0; ei<this._edges.length; ei++){
+      const poly = points[ei];
+      const m = poly.length;
+      if(m <= 2) continue;
+
+      // spring force along the polyline (keeps it smooth)
+      for(let i=1;i<m-1;i++){
+        const prev = poly[i-1], cur=poly[i], next=poly[i+1];
+        // spring towards average of neighbors
+        const target = [(prev[0]+next[0])/2, (prev[1]+next[1])/2];
+        const spring = ForceEdgeBundling.mul(ForceEdgeBundling.sub(target,cur), this._K);
+        newPts[ei][i][0] += spring[0]*this._stepSize;
+        newPts[ei][i][1] += spring[1]*this._stepSize;
+      }
+    }
+
+    // electrostatic-like attraction between compatible edges at corresponding indices
+    for(let ei=0; ei<this._edges.length; ei++){
+      const polyI = points[ei];
+      const m = polyI.length;
+      if(m <= 2) continue;
+
+      for(const ej of compatLists[ei]){
+        const polyJ = points[ej];
+        // resample to same count by index mapping
+        for(let i=1;i<m-1;i++){
+          const t = i/(m-1);
+          const j = Math.round(t*(polyJ.length-1));
+          if(j<=0 || j>=polyJ.length-1) continue;
+
+          const pi = polyI[i], pj = polyJ[j];
+          const dir = ForceEdgeBundling.sub(pj,pi);
+          // attraction only (no repulsion)
+          newPts[ei][i][0] += dir[0]*this._S*this._stepSize;
+          newPts[ei][i][1] += dir[1]*this._S*this._stepSize;
+        }
+      }
+    }
+
+    // keep endpoints pinned exactly to nodes
+    for(let k=0;k<this._edges.length;k++){
+      const e=this._edges[k];
+      const s=this._nodes[e.source], t=this._nodes[e.target];
+      newPts[k][0] = [s.x,s.y];
+      newPts[k][newPts[k].length-1] = [t.x,t.y];
+    }
+    return newPts;
+  }
+
+  bundle(onProgress){
+    if(!this._nodes?.length || !this._edges?.length) return [];
+
+    const compatLists = this._buildCompatibilityLists();
+    let points = this._initialEdgePoints();
+
+    // iterative refinement: subdivide and run cycles/iterations
+    for(let r=0; r<this._subdivision; r++){
+      points = this._subdivide(points);
+    }
+
+    for(let c=0; c<this._cycles; c++){
+      for(let it=0; it<this._iterations; it++){
+        points = this._applyForces(points, compatLists);
+        if(onProgress && (it % 10 === 0)) onProgress({cycle:c+1, iter:it+1});
+      }
+      // gradually tighten step size and attraction
+      this._S *= 0.8;
+      this._K *= 1.1;
+    }
+    return points;
+  }
+}
+
+// --------- App code ----------
+const svg = d3.select("#viz");
+const statusEl = document.querySelector("#status");
+
+const line = d3.line().curve(d3.curveCatmullRom.alpha(0.5));
+
+const ui = {
+  ct: document.querySelector("#ct"),
+  ctv: document.querySelector("#ctv"),
+  cycles: document.querySelector("#cycles"),
+  cyclesv: document.querySelector("#cyclesv"),
+  iters: document.querySelector("#iters"),
+  itersv: document.querySelector("#itersv"),
+  sub: document.querySelector("#sub"),
+  subv: document.querySelector("#subv"),
+  step: document.querySelector("#step"),
+  stepv: document.querySelector("#stepv"),
+  run: document.querySelector("#run")
+};
+
+function syncLabels(){
+  ui.ctv.textContent = (+ui.ct.value).toFixed(2);
+  ui.cyclesv.textContent = ui.cycles.value;
+  ui.itersv.textContent = ui.iters.value;
+  ui.subv.textContent = ui.sub.value;
+  ui.stepv.textContent = (+ui.step.value).toFixed(2);
+}
+["ct","cycles","iters","sub","step"].forEach(k => ui[k].addEventListener("input", syncLabels));
+syncLabels();
+
+// Load CSVs (place the HTML in the same folder as Node_AirPorts.csv and Edge_AirPorts.csv)
+Promise.all([
+  d3.csv("Node_Japan.csv", d => ({ id:+d.Node, x:+d.x, y:+d.y })),
+  d3.csv("Edge_Japan.csv", d => ({ source:+d.source, target:+d.target }))
+]).then(([nodesRaw, edgesRaw]) => {
+  // Build index by node id (Node IDs start at 1)
+  const idToIndex = new Map(nodesRaw.map((n,i)=>[n.id,i]));
+  const nodes = nodesRaw.map(n => ({...n}));
+
+  const edges = edgesRaw
+    .filter(e => idToIndex.has(e.source) && idToIndex.has(e.target))
+    .map(e => ({ source:idToIndex.get(e.source), target:idToIndex.get(e.target) }));
+
+  // Set viewBox to fit data
+  const xs = nodes.map(n=>n.x), ys = nodes.map(n=>n.y);
+  const pad = 30;
+  const minX = d3.min(xs)-pad, maxX=d3.max(xs)+pad;
+  const minY = d3.min(ys)-pad, maxY=d3.max(ys)+pad;
+  svg.attr("viewBox", `${minX} ${minY} ${maxX-minX} ${maxY-minY}`);
+
+  // Draw nodes (optional; can be heavy with 3k nodes)
+  svg.append("g").attr("id","nodes")
+    .selectAll("circle")
+    .data(nodes)
+    .join("circle")
+    .attr("class","node")
+    .attr("r", 1.6)
+    .attr("cx", d=>d.x)
+    .attr("cy", d=>d.y);
+
+  const edgeLayer = svg.append("g").attr("id","edges");
+
+  function drawRawEdges(){
+    edgeLayer.selectAll("path").remove();
+    edgeLayer.selectAll("path")
+      .data(edges)
+      .join("path")
+      .attr("class","edge")
+      .attr("d", e => line([[nodes[e.source].x,nodes[e.source].y],[nodes[e.target].x,nodes[e.target].y]]));
+  }
+
+  function drawBundled(polylines){
+    edgeLayer.selectAll("path").remove();
+    edgeLayer.selectAll("path")
+      .data(polylines)
+      .join("path")
+      .attr("class","edge")
+      .attr("d", d => line(d));
+  }
+
+  drawRawEdges();
+
+  ui.run.addEventListener("click", () => {
+    statusEl.textContent = "Bundling...";
+    // Run bundling on a microtask to let UI update
+    setTimeout(() => {
+      const bundler = new ForceEdgeBundling()
+        .nodes(nodes)
+        .edges(edges)
+        .compatibilityThreshold(+ui.ct.value)
+        .cycles(+ui.cycles.value)
+        .iterations(+ui.iters.value)
+        .subdivision(+ui.sub.value)
+        .stepSize(+ui.step.value);
+
+      const polylines = bundler.bundle((p) => {
+        statusEl.textContent = `Bundling... cycle ${p.cycle}/${ui.cycles.value}, iter ${p.iter}/${ui.iters.value}`;
+      });
+      drawBundled(polylines);
+      statusEl.textContent = `Done. Bundled edges: ${polylines.length.toLocaleString()}`;
+    }, 20);
+  });
+
+  statusEl.textContent = `Loaded. Nodes: ${nodes.length.toLocaleString()}, Edges: ${edges.length.toLocaleString()}.`;
+}).catch(err => {
+  console.error(err);
+  statusEl.textContent = "Failed to load CSVs. Open devtools console.";
+});
+</script>
+</body>
+</html>
